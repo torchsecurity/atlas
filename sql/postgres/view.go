@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"ariga.io/atlas/sql/internal/sqlx"
+	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/schema"
 )
 
@@ -219,6 +220,206 @@ func hasViews(realm *schema.Realm) bool {
 		}
 	}
 	return false
+}
+
+// addView builds and appends the statements for creating a view.
+func (s *state) addView(add *schema.AddView) error {
+	if err := supportedView(add.V); err != nil {
+		return err
+	}
+	create, err := s.createView(add.V)
+	if err != nil {
+		return err
+	}
+	s.append(&migrate.Change{
+		Cmd:     create,
+		Source:  add,
+		Comment: fmt.Sprintf("create %q view", add.V.Name),
+		Reverse: s.Build("DROP VIEW").View(add.V).String(),
+	})
+	s.addViewComments(add, add.V)
+	return nil
+}
+
+// dropView builds and appends the statement for dropping a view. Note, the
+// statement is never extended with a CASCADE clause on its own, as dropping
+// dependent views is the job of the changes sorting.
+func (s *state) dropView(drop *schema.DropView) error {
+	if err := supportedView(drop.V); err != nil {
+		return err
+	}
+	reverse, err := s.createView(drop.V)
+	if err != nil {
+		return fmt.Errorf("calculate reverse for drop view %q: %w", drop.V.Name, err)
+	}
+	b := s.Build("DROP VIEW")
+	if sqlx.Has(drop.Extra, &schema.IfExists{}) {
+		b.P("IF EXISTS")
+	}
+	b.View(drop.V)
+	if sqlx.Has(drop.Extra, &Cascade{}) {
+		b.P("CASCADE")
+	}
+	s.append(&migrate.Change{
+		Cmd:     b.String(),
+		Source:  drop,
+		Comment: fmt.Sprintf("drop %q view", drop.V.Name),
+		Reverse: reverse,
+	})
+	return nil
+}
+
+// modifyView builds and appends the statements that bring the view into its
+// modified state. Views hold no data, hence a definition change is planned as
+// a DROP and a CREATE, sidestepping the column-shape restrictions of the
+// "CREATE OR REPLACE VIEW" command. Changes that do not touch the definition
+// (i.e. comments) are planned in place.
+func (s *state) modifyView(modify *schema.ModifyView) error {
+	if err := supportedView(modify.From); err != nil {
+		return err
+	}
+	if err := supportedView(modify.To); err != nil {
+		return err
+	}
+	if !sqlx.BodyDefChanged(modify.From.Def, modify.To.Def) {
+		return s.modifyViewAttrs(modify)
+	}
+	create, err := s.createView(modify.To)
+	if err != nil {
+		return err
+	}
+	reverse, err := s.createView(modify.From)
+	if err != nil {
+		return fmt.Errorf("calculate reverse for modify view %q: %w", modify.From.Name, err)
+	}
+	s.append(
+		&migrate.Change{
+			Cmd:     s.Build("DROP VIEW").View(modify.From).String(),
+			Source:  modify,
+			Comment: fmt.Sprintf("drop %q view before recreating it", modify.From.Name),
+			Reverse: reverse,
+		},
+		&migrate.Change{
+			Cmd:     create,
+			Source:  modify,
+			Comment: fmt.Sprintf("recreate %q view", modify.To.Name),
+			Reverse: s.Build("DROP VIEW").View(modify.To).String(),
+		},
+	)
+	// The comments of the view and its columns are
+	// dropped with it and need to be set again.
+	s.addViewComments(modify, modify.To)
+	return nil
+}
+
+// modifyViewAttrs plans the view changes that do not require
+// recreating it. Currently, only comments are supported.
+func (s *state) modifyViewAttrs(modify *schema.ModifyView) error {
+	for _, c := range modify.Changes {
+		switch c := c.(type) {
+		case *schema.AddAttr, *schema.ModifyAttr:
+			from, to, err := commentChange(c)
+			if err != nil {
+				return err
+			}
+			s.append(s.viewComment(modify, modify.To, to, from))
+		case *schema.ModifyColumn:
+			if c.Change != schema.ChangeComment {
+				return fmt.Errorf("unsupported change for view column %q: only comments can be modified", c.To.Name)
+			}
+			from, to, err := commentChange(sqlx.CommentDiff(c.From.Attrs, c.To.Attrs))
+			if err != nil {
+				return err
+			}
+			s.append(s.viewColumnComment(modify, modify.To, c.To, to, from))
+		default:
+			return fmt.Errorf("unsupported view change %T", c)
+		}
+	}
+	return nil
+}
+
+// renameView builds and appends the statement for renaming a view.
+func (s *state) renameView(c *schema.RenameView) error {
+	if err := supportedView(c.From); err != nil {
+		return err
+	}
+	if err := supportedView(c.To); err != nil {
+		return err
+	}
+	s.append(&migrate.Change{
+		Source:  c,
+		Comment: fmt.Sprintf("rename a view from %q to %q", c.From.Name, c.To.Name),
+		Cmd:     s.Build("ALTER VIEW").View(c.From).P("RENAME TO").Ident(c.To.Name).String(),
+		Reverse: s.Build("ALTER VIEW").View(c.To).P("RENAME TO").Ident(c.From.Name).String(),
+	})
+	return nil
+}
+
+// createView returns the "CREATE VIEW" statement for the given view. The column
+// list is always written explicitly, as the definition might select all columns
+// of its underlying relations (i.e. "SELECT *"), and the list is what pins the
+// names of the view columns.
+func (s *state) createView(v *schema.View) (string, error) {
+	def := viewDef(v.Def)
+	if def == "" {
+		return "", fmt.Errorf("missing definition for view %q", v.Name)
+	}
+	b := s.Build("CREATE VIEW").View(v)
+	if len(v.Columns) > 0 {
+		b.Wrap(func(b *sqlx.Builder) {
+			b.MapComma(v.Columns, func(i int, b *sqlx.Builder) {
+				b.Ident(v.Columns[i].Name)
+			})
+		})
+	}
+	b.P("AS", def)
+	if o := (schema.ViewCheckOption{}); sqlx.Has(v.Attrs, &o) && !strings.EqualFold(o.V, "NONE") {
+		b.P("WITH", strings.ToUpper(o.V), "CHECK OPTION")
+	}
+	return b.String(), nil
+}
+
+// addViewComments appends the comments of the view and its columns, if any.
+func (s *state) addViewComments(src schema.Change, v *schema.View) {
+	var c schema.Comment
+	if sqlx.Has(v.Attrs, &c) && c.Text != "" {
+		s.append(s.viewComment(src, v, c.Text, ""))
+	}
+	for _, col := range v.Columns {
+		if sqlx.Has(col.Attrs, &c) && c.Text != "" {
+			s.append(s.viewColumnComment(src, v, col, c.Text, ""))
+		}
+	}
+}
+
+func (s *state) viewComment(src schema.Change, v *schema.View, to, from string) *migrate.Change {
+	b := s.Build("COMMENT ON VIEW").View(v).P("IS")
+	return &migrate.Change{
+		Cmd:     b.Clone().P(quote(to)).String(),
+		Source:  src,
+		Comment: fmt.Sprintf("set comment to view: %q", v.Name),
+		Reverse: b.Clone().P(quote(from)).String(),
+	}
+}
+
+func (s *state) viewColumnComment(src schema.Change, v *schema.View, c *schema.Column, to, from string) *migrate.Change {
+	b := s.Build("COMMENT ON COLUMN").ViewResource(v, c).P("IS")
+	return &migrate.Change{
+		Cmd:     b.Clone().P(quote(to)).String(),
+		Source:  src,
+		Comment: fmt.Sprintf("set comment to column: %q on view: %q", c.Name, v.Name),
+		Reverse: b.Clone().P(quote(from)).String(),
+	}
+}
+
+// supportedView reports an error in case the view is not
+// supported by this version. i.e., materialized views.
+func supportedView(v *schema.View) error {
+	if v.Materialized() {
+		return fmt.Errorf("postgres: materialized views are not supported by this version: %q", v.Name)
+	}
+	return nil
 }
 
 const (

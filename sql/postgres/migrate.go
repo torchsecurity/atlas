@@ -90,6 +90,12 @@ func (s *state) plan(changes []schema.Change) error {
 			s.renameTable(c)
 		case *schema.DropTable:
 			err = s.dropTable(c)
+		case *schema.AddView:
+			err = s.addView(c)
+		case *schema.ModifyView:
+			err = s.modifyView(c)
+		case *schema.DropView:
+			err = s.dropView(c)
 		case *schema.AddObject:
 			err = s.addObject(c)
 		case *schema.ModifyObject:
@@ -163,6 +169,10 @@ func (s *state) topLevel(changes []schema.Change) ([]schema.Change, error) {
 				Source:  c,
 				Comment: fmt.Sprintf("Drop schema named %q", c.S.Name),
 			})
+		case *schema.RenameView:
+			if err := s.renameView(c); err != nil {
+				return nil, err
+			}
 		case *schema.RenameObject:
 			e1, ok1 := c.From.(*schema.EnumType)
 			e2, ok2 := c.To.(*schema.EnumType)
