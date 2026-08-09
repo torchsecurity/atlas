@@ -72,10 +72,10 @@ func (s *Schema) AddTables(tables ...*Table) *Schema {
 	return s
 }
 
-// AddViews adds the given views to the schema.
+// AddViews adds and links the given views to the schema.
 func (s *Schema) AddViews(views ...*View) *Schema {
 	for _, v := range views {
-		v.Schema = s
+		v.SetSchema(s)
 	}
 	s.Views = append(s.Views, views...)
 	return s
@@ -142,26 +142,72 @@ func NewTable(name string) *Table {
 	return &Table{Name: name}
 }
 
-// NewView creates a new View with the given name and definition.
+// NewView creates a new View.
 func NewView(name, def string) *View {
 	return &View{Name: name, Def: def}
 }
 
-// SetComment sets or appends the Comment attribute to the view with the given value.
-func (v *View) SetComment(c string) *View {
-	ReplaceOrAppend(&v.Attrs, &Comment{Text: c})
+// NewMaterializedView creates a new materialized View.
+func NewMaterializedView(name, def string) *View {
+	return NewView(name, def).
+		SetMaterialized(true)
+}
+
+// SetSchema sets the schema (named-database) of the view.
+func (v *View) SetSchema(s *Schema) *View {
+	v.Schema = s
 	return v
 }
 
-// AddColumns adds the given columns to the view.
+// AddColumns appends the given columns to the view column list.
 func (v *View) AddColumns(columns ...*Column) *View {
 	v.Columns = append(v.Columns, columns...)
 	return v
 }
 
-// AddDeps adds the given dependencies to the view.
-func (v *View) AddDeps(deps ...Object) *View {
-	v.Deps = append(v.Deps, deps...)
+// SetComment sets or appends the Comment attribute
+// to the view with the given value.
+func (v *View) SetComment(c string) *View {
+	ReplaceOrAppend(&v.Attrs, &Comment{Text: c})
+	return v
+}
+
+// AddAttrs adds and additional attributes to the view.
+func (v *View) AddAttrs(attrs ...Attr) *View {
+	v.Attrs = append(v.Attrs, attrs...)
+	return v
+}
+
+// AddDeps adds the given objects as dependencies to the view.
+func (v *View) AddDeps(objs ...Object) *View {
+	v.Deps = append(v.Deps, objs...)
+	addRefs(v, objs)
+	return v
+}
+
+// RemoveDep removes the given object from the view dependencies.
+func (v *View) RemoveDep(o Object) {
+	v.Deps = removeObj(v.Deps, o)
+}
+
+// AddRefs adds references to the view.
+func (v *View) AddRefs(refs ...Object) {
+	v.Refs = append(v.Refs, refs...)
+	SortRefs(v.Refs)
+}
+
+// AddIndexes appends the given indexes to the view index list.
+func (v *View) AddIndexes(indexes ...*Index) *View {
+	for _, idx := range indexes {
+		idx.View = v
+	}
+	v.Indexes = append(v.Indexes, indexes...)
+	return v
+}
+
+// SetCheckOption sets the check option of the view.
+func (v *View) SetCheckOption(opt string) *View {
+	ReplaceOrAppend(&v.Attrs, &ViewCheckOption{V: opt})
 	return v
 }
 
@@ -304,6 +350,10 @@ func SortRefs(refs []Object) {
 		switch o1 := a.(type) {
 		case *Table:
 			return strings.Compare(o1.Name, b.(*Table).Name)
+		case *View:
+			return strings.Compare(o1.Name, b.(*View).Name)
+		case *Trigger:
+			return strings.Compare(o1.Name, b.(*Trigger).Name)
 		default:
 			return 0
 		}

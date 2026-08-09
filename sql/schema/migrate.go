@@ -87,6 +87,31 @@ type (
 		From, To *Table
 	}
 
+	// AddView describes a view creation change.
+	AddView struct {
+		V     *View
+		Extra []Clause // Extra clauses and options.
+	}
+
+	// DropView describes a view removal change.
+	DropView struct {
+		V     *View
+		Extra []Clause // Extra clauses.
+	}
+
+	// ModifyView describes a view modification change.
+	ModifyView struct {
+		From, To *View
+		// Changes that are extra to the view definition.
+		// For example, adding or dropping indexes.
+		Changes []Change
+	}
+
+	// RenameView describes a view rename change.
+	RenameView struct {
+		From, To *View
+	}
+
 	// AddObject describes a generic object creation change.
 	AddObject struct {
 		O     Object
@@ -567,6 +592,10 @@ func (*AddTable) change()         {}
 func (*DropTable) change()        {}
 func (*ModifyTable) change()      {}
 func (*RenameTable) change()      {}
+func (*AddView) change()          {}
+func (*DropView) change()         {}
+func (*ModifyView) change()       {}
+func (*RenameView) change()       {}
 func (*AddObject) change()        {}
 func (*DropObject) change()       {}
 func (*ModifyObject) change()     {}

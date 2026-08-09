@@ -51,12 +51,15 @@ type (
 
 	// A View represents a view definition.
 	View struct {
-		Name    string
-		Schema  *Schema
-		Def     string
-		Columns []*Column
-		Attrs   []Attr
-		Deps    []Object // Objects this view depends on.
+		Name     string
+		Schema   *Schema
+		Def      string
+		Columns  []*Column
+		Attrs    []Attr     // Attrs and options.
+		Indexes  []*Index   // Indexes on materialized view.
+		Triggers []*Trigger // Triggers on the view.
+		Deps     []Object   // Objects this view depends on.
+		Refs     []Object   // Objects that depends on this view.
 	}
 
 	// A Column represents a column definition.
@@ -87,9 +90,11 @@ type (
 	Index struct {
 		Name   string
 		Unique bool
-		Table  *Table
-		Attrs  []Attr
-		Parts  []*IndexPart
+		// Table or View that this index belongs to.
+		Table *Table
+		View  *View
+		Attrs []Attr
+		Parts []*IndexPart
 	}
 
 	// An IndexPart represents an index part that
@@ -118,7 +123,62 @@ type (
 		Attrs      []Attr
 	}
 
+	// A Trigger represents a trigger definition.
+	//
+	// Note, only the type is restored at this layer to allow views (and tables)
+	// to carry their triggers. Trigger diffing and planning are not supported.
+	Trigger struct {
+		Name string
+		// Table or View that this trigger belongs to.
+		Table      *Table
+		View       *View
+		ActionTime TriggerTime    // BEFORE, AFTER, or INSTEAD OF.
+		Events     []TriggerEvent // INSERT, UPDATE, DELETE, etc.
+		For        TriggerFor     // FOR EACH ROW or FOR EACH STATEMENT.
+		Body       string         // Trigger body only.
+		Attrs      []Attr         // WHEN, REFERENCING, etc.
+		Deps       []Object       // Objects this trigger depends on.
+		Refs       []Object       // Objects that depend on this trigger.
+	}
+
+	// TriggerTime represents the trigger action time.
+	TriggerTime string
+
+	// TriggerFor represents the trigger FOR EACH spec.
+	TriggerFor string
+
+	// TriggerEvent represents the trigger event.
+	TriggerEvent struct {
+		Name    string    // Name of the event (e.g. INSERT, UPDATE, DELETE).
+		Columns []*Column // Columns that might be associated with the event.
+	}
 )
+
+// List of supported trigger action times.
+const (
+	TriggerTimeBefore  TriggerTime = "BEFORE"
+	TriggerTimeAfter   TriggerTime = "AFTER"
+	TriggerTimeInstead TriggerTime = "INSTEAD OF"
+)
+
+// List of supported trigger FOR EACH spec.
+const (
+	TriggerForRow  TriggerFor = "ROW"
+	TriggerForStmt TriggerFor = "STATEMENT"
+)
+
+// List of supported trigger events.
+var (
+	TriggerEventInsert   = TriggerEvent{Name: "INSERT"}
+	TriggerEventUpdate   = TriggerEvent{Name: "UPDATE"}
+	TriggerEventDelete   = TriggerEvent{Name: "DELETE"}
+	TriggerEventTruncate = TriggerEvent{Name: "TRUNCATE"}
+)
+
+// TriggerEventUpdateOf returns an UPDATE OF trigger event.
+func TriggerEventUpdateOf(columns ...*Column) TriggerEvent {
+	return TriggerEvent{Name: "UPDATE OF", Columns: columns}
+}
 
 // Schema returns the first schema that matched the given name.
 func (r *Realm) Schema(name string) (*Schema, bool) {
@@ -172,6 +232,26 @@ func (s *Schema) Table(name string) (*Table, bool) {
 	for _, t := range s.Tables {
 		if t.Name == name {
 			return t, true
+		}
+	}
+	return nil, false
+}
+
+// View returns the first view that matched the given name.
+func (s *Schema) View(name string) (*View, bool) {
+	for _, v := range s.Views {
+		if v.Name == name && !v.Materialized() {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+// Materialized returns the first materialized view that matched the given name.
+func (s *Schema) Materialized(name string) (*View, bool) {
+	for _, v := range s.Views {
+		if v.Name == name && v.Materialized() {
+			return v, true
 		}
 	}
 	return nil, false
@@ -237,6 +317,73 @@ func (t *Table) Checks() (ck []*Check) {
 	return ck
 }
 
+// Pos of the view, if exists.
+func (v *View) Pos() *Pos {
+	for _, a := range v.Attrs {
+		if p, ok := a.(*Pos); ok {
+			return p
+		}
+	}
+	return nil
+}
+
+// Materialized reports if the view is materialized.
+func (v *View) Materialized() bool {
+	for _, a := range v.Attrs {
+		if _, ok := a.(*Materialized); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// SetMaterialized reports if the view is materialized.
+func (v *View) SetMaterialized(b bool) *View {
+	if b {
+		ReplaceOrAppend(&v.Attrs, &Materialized{})
+	} else {
+		v.Attrs = RemoveAttr[*Materialized](v.Attrs)
+	}
+	return v
+}
+
+// Column returns the first column that matched the given name.
+func (v *View) Column(name string) (*Column, bool) {
+	for _, c := range v.Columns {
+		if c.Name == name {
+			return c, true
+		}
+	}
+	return nil, false
+}
+
+// Index returns the first index that matched the given name.
+func (v *View) Index(name string) (*Index, bool) {
+	for _, i := range v.Indexes {
+		if i.Name == name {
+			return i, true
+		}
+	}
+	return nil, false
+}
+
+// Trigger returns the first trigger that matches the given name.
+func (v *View) Trigger(name string) (*Trigger, bool) {
+	for _, r := range v.Triggers {
+		if r.Name == name {
+			return r, true
+		}
+	}
+	return nil, false
+}
+
+// AsTable returns a table that represents the view.
+func (v *View) AsTable() *Table {
+	return NewTable(v.Name).
+		SetSchema(v.Schema).
+		AddColumns(v.Columns...)
+}
+
 // SetPos sets the position of the schema.
 func (s *Schema) SetPos(p *Pos) {
 	ReplaceOrAppend(&s.Attrs, p)
@@ -250,6 +397,26 @@ func (e *EnumType) SetPos(p *Pos) {
 // SetPos sets the position of the table.
 func (t *Table) SetPos(p *Pos) {
 	ReplaceOrAppend(&t.Attrs, p)
+}
+
+// SetPos sets the position of the view.
+func (v *View) SetPos(p *Pos) {
+	ReplaceOrAppend(&v.Attrs, p)
+}
+
+// SetPos sets the position of the trigger.
+func (t *Trigger) SetPos(p *Pos) {
+	ReplaceOrAppend(&t.Attrs, p)
+}
+
+// Pos of the trigger, if exists.
+func (t *Trigger) Pos() *Pos {
+	for _, a := range t.Attrs {
+		if p, ok := a.(*Pos); ok {
+			return p
+		}
+	}
+	return nil
 }
 
 // SetPos sets the position of the column.
@@ -541,6 +708,17 @@ type (
 		Type string // Optional type. e.g. STORED or VIRTUAL.
 	}
 
+	// ViewCheckOption describes the standard 'WITH CHECK OPTION clause' of a view.
+	ViewCheckOption struct {
+		V string // LOCAL, CASCADED, NONE, or driver specific.
+	}
+
+	// Materialized is a schema attribute that attached to views to indicates
+	// they are MATERIALIZED VIEWs.
+	Materialized struct {
+		Attr
+	}
+
 	// Pos is an attribute that holds the position of a schema element.
 	Pos struct {
 		// Filename is the name (or full path) of the file which loaded the schema element.
@@ -576,9 +754,17 @@ func (p *Pos) String() string {
 	return b.String()
 }
 
+// A list of known view check options.
+const (
+	ViewCheckOptionNone     = "NONE"
+	ViewCheckOptionLocal    = "LOCAL"
+	ViewCheckOptionCascaded = "CASCADED"
+)
+
 // objects.
 func (*Table) obj()    {}
 func (*View) obj()     {}
+func (*Trigger) obj()  {}
 func (*EnumType) obj() {}
 
 // constraints are objects.
@@ -612,6 +798,7 @@ func (*Comment) attr()         {}
 func (*Charset) attr()         {}
 func (*Collation) attr()       {}
 func (*GeneratedExpr) attr()   {}
+func (*ViewCheckOption) attr() {}
 
 // SpecType returns the type of the spec.
 func (e *EnumType) SpecType() string { return "enum" }

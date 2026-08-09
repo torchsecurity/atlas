@@ -126,6 +126,26 @@ func excludeS(s *Schema, glob []string) (err error) {
 		}
 		s.Tables = tables
 	}
+	if globV, exclude := excludeType(typeV, glob[0]); exclude {
+		var views []*View
+		for _, v := range s.Views {
+			match, err := filepath.Match(globV, v.Name)
+			if err != nil {
+				return err
+			}
+			if match {
+				if len(glob) == 1 {
+					detachObject(v, v.Refs)
+					continue
+				}
+				if err := excludeV(v, glob[1]); err != nil {
+					return err
+				}
+			}
+			views = append(views, v)
+		}
+		s.Views = views
+	}
 	return nil
 }
 
@@ -179,6 +199,24 @@ func excludeT(t *Table, pattern string) (err error) {
 	return
 }
 
+func excludeV(v *View, pattern string) (err error) {
+	if p, exclude := excludeType(typeC, pattern); exclude {
+		v.Columns, err = filter(v.Columns, func(c *Column) (bool, error) {
+			match, err := filepath.Match(p, c.Name)
+			if !match || err != nil {
+				return false, err
+			}
+			return true, nil
+		})
+	}
+	if p, exclude := excludeType(typeTg, pattern); exclude {
+		v.Triggers, err = filter(v.Triggers, func(t *Trigger) (bool, error) {
+			return filepath.Match(p, t.Name)
+		})
+	}
+	return
+}
+
 // SpecTypeNamer is an interface that allows to get the spec type and name of the object.
 type SpecTypeNamer interface {
 	SpecType() string
@@ -221,12 +259,14 @@ func excludeObjects(all []Object, glob []string) ([]Object, error) {
 }
 
 const (
-	typeT = "table"
-	typeS = "schema"
-	typeC = "column"
-	typeI = "index"
-	typeF = "fk"
-	typeK = "check"
+	typeV  = "view"
+	typeT  = "table"
+	typeS  = "schema"
+	typeC  = "column"
+	typeI  = "index"
+	typeF  = "fk"
+	typeK  = "check"
+	typeTg = "trigger"
 )
 
 var reType = regexp.MustCompile(`\[type=([a-z|_]+)+\]$`)
