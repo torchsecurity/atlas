@@ -822,6 +822,21 @@ func dependsOn(c1, c2 schema.Change, _ SortOptions) bool {
 					return ok && refTo([]*schema.ForeignKey{fk.F}, c2.T) && slices.ContainsFunc(fk.F.Columns, func(c *schema.Column) bool { return addC[c] })
 				})
 			}
+		case *schema.DropView:
+			// A column cannot be dropped or altered while a view still selects from
+			// it. Hence, dropped views are planned before their base-table changes.
+			if slices.ContainsFunc(c1.Changes, func(c schema.Change) bool {
+				switch c.(type) {
+				case *schema.DropColumn, *schema.ModifyColumn, *schema.RenameColumn:
+					return true
+				}
+				return false
+			}) && slices.ContainsFunc(c2.V.Deps, func(o schema.Object) bool {
+				t, ok := o.(*schema.Table)
+				return ok && t.Name == c1.T.Name && SameSchema(t.Schema, c1.T.Schema)
+			}) {
+				return true
+			}
 		case *schema.AddObject:
 			t, ok := c2.O.(schema.Type)
 			if ok && slices.ContainsFunc(c1.Changes, func(c schema.Change) bool {
