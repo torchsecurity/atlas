@@ -58,6 +58,11 @@ func (i *inspect) InspectRealm(ctx context.Context, opts *schema.InspectRealmOpt
 			}
 			sqlx.LinkSchemaTables(schemas)
 		}
+		if mode.Is(schema.InspectViews) {
+			if err := i.inspectViews(ctx, r, nil); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return schema.ExcludeRealm(r, opts.Exclude)
 }
@@ -127,6 +132,11 @@ func (i *inspect) InspectSchema(ctx context.Context, name string, opts *schema.I
 			return nil, err
 		}
 		sqlx.LinkSchemaTables(schemas)
+	}
+	if mode.Is(schema.InspectViews) {
+		if err := i.inspectViews(ctx, r, opts); err != nil {
+			return nil, err
+		}
 	}
 	return schema.ExcludeSchema(r.Schemas[0], opts.Exclude)
 }
@@ -231,8 +241,24 @@ func (i *inspect) columns(ctx context.Context, s *schema.Schema) error {
 	return rows.Err()
 }
 
-// addColumn scans the current row and adds a new column from it to the scope (table or view).
-func (i *inspect) addColumn(s *schema.Schema, rows *sql.Rows) (err error) {
+// addColumn scans the current row and adds a new column from it to its table.
+func (i *inspect) addColumn(s *schema.Schema, rows *sql.Rows) error {
+	table, c, err := i.scanColumn(s, rows)
+	if err != nil {
+		return err
+	}
+	t, ok := s.Table(table)
+	if !ok {
+		return fmt.Errorf("table %q was not found in schema", table)
+	}
+	t.AddColumns(c)
+	return nil
+}
+
+// scanColumn scans the current row into a column and returns it along with the
+// name of the relation (table or view) it belongs to. Note, the caller is the
+// one that attaches the column to its scope.
+func (i *inspect) scanColumn(s *schema.Schema, rows *sql.Rows) (_ string, _ *schema.Column, err error) {
 	var (
 		typid, typelem, maxlen, precision, timeprecision, scale, seqstart, seqinc, seqlast, attnum                                 sql.NullInt64
 		table, name, typ, fmtype, nullable, defaults, identity, genidentity, genexpr, charset, collate, comment, typtype, interval sql.NullString
@@ -241,11 +267,7 @@ func (i *inspect) addColumn(s *schema.Schema, rows *sql.Rows) (err error) {
 		&table, &name, &typ, &fmtype, &nullable, &defaults, &maxlen, &precision, &timeprecision, &scale, &interval, &charset,
 		&collate, &identity, &seqstart, &seqinc, &seqlast, &genidentity, &genexpr, &comment, &typtype, &typelem, &typid, &attnum,
 	); err != nil {
-		return err
-	}
-	t, ok := s.Table(table.String)
-	if !ok {
-		return fmt.Errorf("table %q was not found in schema", table.String)
+		return "", nil, err
 	}
 	c := &schema.Column{
 		Name: name.String,
@@ -311,8 +333,7 @@ func (i *inspect) addColumn(s *schema.Schema, rows *sql.Rows) (err error) {
 	if sqlx.ValidString(collate) {
 		c.SetCollation(collate.String)
 	}
-	t.AddColumns(c)
-	return nil
+	return table.String, c, nil
 }
 
 // parseType is like ParseType, but aware of the Realm state.
