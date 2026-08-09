@@ -593,9 +593,11 @@ var (
 	specOptions []schemahcl.Option
 	specFuncs   = &specutil.SchemaFuncs{
 		Table: tableSpec,
+		View:  viewSpec,
 	}
 	scanFuncs = &specutil.ScanFuncs{
 		Table: convertTable,
+		View:  convertView,
 	}
 )
 
@@ -790,24 +792,58 @@ func convertTypes(d *doc, r *schema.Realm) error {
 		es.AddObjects(e1)
 		byName[e.Name] = e1
 	}
-	for _, t := range d.Tables {
+	if err := convertTableTypes(d.Tables, r, byName); err != nil {
+		return err
+	}
+	// Views and materialized views may reference enums on their
+	// column types the same way tables do.
+	if err := convertViewTypes(d.Views, r, byName, false); err != nil {
+		return err
+	}
+	return convertViewTypes(d.Materialized, r, byName, true)
+}
+
+// columnEnum returns the enum type referenced by the given column
+// spec, or nil if the column does not reference an enum.
+func columnEnum(c *sqlspec.Column, byName map[string]*schema.EnumType) (*schema.EnumType, error) {
+	if c.Type == nil {
+		return nil, nil
+	}
+	if c.Type.IsRefTo("enum") {
+		n, err := enumName(c.Type)
+		if err != nil {
+			return nil, err
+		}
+		e, ok := byName[n]
+		if !ok {
+			return nil, fmt.Errorf("enum %q was not found in realm", n)
+		}
+		return e, nil
+	}
+	if n, ok := arrayType(c.Type.T); ok {
+		return byName[n], nil
+	}
+	return nil, nil
+}
+
+// setColumnEnum sets the resolved enum type on the given
+// column, descending into array types if necessary.
+func setColumnEnum(c *schema.Column, e *schema.EnumType) {
+	switch t := c.Type.Type.(type) {
+	case *ArrayType:
+		t.Type = e
+	default:
+		c.Type.Type = e
+	}
+}
+
+// convertTableTypes resolves the referenced column types on the given table specs.
+func convertTableTypes(specs []*sqlspec.Table, r *schema.Realm, byName map[string]*schema.EnumType) error {
+	for _, t := range specs {
 		for _, c := range t.Columns {
-			var enum *schema.EnumType
-			switch {
-			case c.Type.IsRefTo("enum"):
-				n, err := enumName(c.Type)
-				if err != nil {
-					return err
-				}
-				e, ok := byName[n]
-				if !ok {
-					return fmt.Errorf("enum %q was not found in realm", n)
-				}
-				enum = e
-			default:
-				if n, ok := arrayType(c.Type.T); ok {
-					enum = byName[n]
-				}
+			enum, err := columnEnum(c, byName)
+			if err != nil {
+				return err
 			}
 			if enum == nil {
 				continue
@@ -828,15 +864,55 @@ func convertTypes(d *doc, r *schema.Realm) error {
 			if !ok {
 				return fmt.Errorf("column %q not found in table %q", c.Name, t.Name)
 			}
-			switch t := cc.Type.Type.(type) {
-			case *ArrayType:
-				t.Type = enum
-			default:
-				cc.Type.Type = enum
-			}
+			setColumnEnum(cc, enum)
 		}
 	}
 	return nil
+}
+
+// convertViewTypes resolves the referenced column types on the given view specs.
+func convertViewTypes(specs []*sqlspec.View, r *schema.Realm, byName map[string]*schema.EnumType, materialized bool) error {
+	kind := "view"
+	if materialized {
+		kind = "materialized"
+	}
+	for _, v := range specs {
+		for _, c := range v.Columns {
+			enum, err := columnEnum(c, byName)
+			if err != nil {
+				return err
+			}
+			if enum == nil {
+				continue
+			}
+			schemaV, err := specutil.SchemaName(v.Schema)
+			if err != nil {
+				return fmt.Errorf("extract schema name from %s reference: %w", kind, err)
+			}
+			vs, ok := r.Schema(schemaV)
+			if !ok {
+				return fmt.Errorf("schema %q not found in realm for %s %q", schemaV, kind, v.Name)
+			}
+			vv, ok := viewByName(vs, v.Name, materialized)
+			if !ok {
+				return fmt.Errorf("%s %q not found in schema %q", kind, v.Name, vs.Name)
+			}
+			cc, ok := vv.Column(c.Name)
+			if !ok {
+				return fmt.Errorf("column %q not found in %s %q", c.Name, kind, v.Name)
+			}
+			setColumnEnum(cc, enum)
+		}
+	}
+	return nil
+}
+
+// viewByName returns the (materialized) view with the given name from the schema.
+func viewByName(s *schema.Schema, name string, materialized bool) (*schema.View, bool) {
+	if materialized {
+		return s.Materialized(name)
+	}
+	return s.View(name)
 }
 
 func indexToUnique(*schema.ModifyIndex) (*AddUniqueConstraint, bool) {

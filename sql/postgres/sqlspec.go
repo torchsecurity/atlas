@@ -24,6 +24,8 @@ import (
 type (
 	doc struct {
 		Tables        []*sqlspec.Table    `spec:"table"`
+		Views         []*sqlspec.View     `spec:"view"`
+		Materialized  []*sqlspec.View     `spec:"materialized"`
 		Enums         []*enum             `spec:"enum"`
 		Domains       []*domain           `spec:"domain"`
 		Composites    []*composite        `spec:"composite"`
@@ -123,6 +125,7 @@ type (
 // merge merges the doc d1 into d.
 func (d *doc) merge(d1 *doc) {
 	d.Enums = append(d.Enums, d1.Enums...)
+	d.Views = append(d.Views, d1.Views...)
 	d.Tables = append(d.Tables, d1.Tables...)
 	d.Domains = append(d.Domains, d1.Domains...)
 	d.Composites = append(d.Composites, d1.Composites...)
@@ -132,12 +135,15 @@ func (d *doc) merge(d1 *doc) {
 	d.Extensions = append(d.Extensions, d1.Extensions...)
 	d.Policies = append(d.Policies, d1.Policies...)
 	d.EventTriggers = append(d.EventTriggers, d1.EventTriggers...)
+	d.Materialized = append(d.Materialized, d1.Materialized...)
 }
 
 func (d *doc) ScanDoc() *specutil.ScanDoc {
 	return &specutil.ScanDoc{
-		Schemas: d.Schemas,
-		Tables:  d.Tables,
+		Schemas:      d.Schemas,
+		Tables:       d.Tables,
+		Views:        d.Views,
+		Materialized: d.Materialized,
 	}
 }
 
@@ -299,6 +305,12 @@ func (c *Codec) MarshalSpec(v any) ([]byte, error) {
 		if err := specutil.QualifyObjects(d.Tables); err != nil {
 			return nil, err
 		}
+		if err := specutil.QualifyObjects(d.Views); err != nil {
+			return nil, err
+		}
+		if err := specutil.QualifyObjects(d.Materialized); err != nil {
+			return nil, err
+		}
 		if err := specutil.QualifyObjects(d.Aggregates); err != nil {
 			return nil, err
 		}
@@ -327,6 +339,9 @@ var (
 	codec = &Codec{
 		State: schemahcl.New(append(specOptions,
 			schemahcl.WithTypes("table.column.type", TypeRegistry.Specs()),
+			schemahcl.WithTypes("view.column.type", TypeRegistry.Specs()),
+			schemahcl.WithTypes("materialized.column.type", TypeRegistry.Specs()),
+			schemahcl.WithScopedEnums("view.check_option", schema.ViewCheckOptionLocal, schema.ViewCheckOptionCascaded),
 			schemahcl.WithScopedEnums("table.index.type", IndexTypeBTree, IndexTypeBRIN, IndexTypeHash, IndexTypeGIN, IndexTypeGiST, "GiST", IndexTypeSPGiST, "SPGiST"),
 			schemahcl.WithScopedEnums("table.partition.type", PartitionTypeRange, PartitionTypeList, PartitionTypeHash),
 			schemahcl.WithScopedEnums("table.column.identity.generated", GeneratedTypeAlways, GeneratedTypeByDefault),
@@ -371,6 +386,28 @@ func convertTable(spec *sqlspec.Table, parent *schema.Schema) (*schema.Table, er
 		return nil, err
 	}
 	return t, nil
+}
+
+// convertView converts a sqlspec.View to a schema.View.
+func convertView(spec *sqlspec.View, parent *schema.Schema) (*schema.View, error) {
+	v, err := specutil.View(
+		spec, parent,
+		func(c *sqlspec.Column, _ *schema.View) (*schema.Column, error) {
+			return specutil.Column(c, convertColumnType)
+		},
+		func(i *sqlspec.Index, v *schema.View) (*schema.Index, error) {
+			idx, err := convertIndex(i, v.AsTable())
+			if err != nil {
+				return nil, err
+			}
+			idx.Table, idx.View = nil, v
+			return idx, nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 // convertUnique converts the unique constraints into indexes.
@@ -703,11 +740,13 @@ func schemaSpec(s *schema.Schema) (*doc, error) {
 		return nil, err
 	}
 	d := &doc{
-		Tables:     spec.Tables,
-		Schemas:    []*sqlspec.Schema{spec.Schema},
-		Enums:      make([]*enum, 0, len(s.Objects)),
-		Domains:    make([]*domain, 0, len(s.Objects)),
-		Composites: make([]*composite, 0, len(s.Objects)),
+		Tables:       spec.Tables,
+		Views:        spec.Views,
+		Materialized: spec.Materialized,
+		Schemas:      []*sqlspec.Schema{spec.Schema},
+		Enums:        make([]*enum, 0, len(s.Objects)),
+		Domains:      make([]*domain, 0, len(s.Objects)),
+		Composites:   make([]*composite, 0, len(s.Objects)),
 	}
 	if err := objectSpec(d, spec, s); err != nil {
 		return nil, err
@@ -753,6 +792,21 @@ func tableSpec(t *schema.Table) (*sqlspec.Table, error) {
 		spec.Extra.Children = append(spec.Extra.Children, fromPartition(p))
 	}
 	tableAttrsSpec(t, spec)
+	return spec, nil
+}
+
+// viewSpec converts from a concrete PostgreSQL schema.View to a sqlspec.View.
+func viewSpec(view *schema.View) (*sqlspec.View, error) {
+	spec, err := specutil.FromView(
+		view,
+		func(c *schema.Column, _ *schema.View) (*sqlspec.Column, error) {
+			return specutil.FromColumn(c, columnTypeSpec)
+		},
+		indexSpec,
+	)
+	if err != nil {
+		return nil, err
+	}
 	return spec, nil
 }
 
