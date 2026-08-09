@@ -157,6 +157,10 @@ type (
 		AddForeignKey    bool `spec:"add_foreign_key"`
 		DropForeignKey   bool `spec:"drop_foreign_key"`
 		ModifyForeignKey bool `spec:"modify_foreign_key"`
+		AddView          bool `spec:"add_view"`
+		DropView         bool `spec:"drop_view"`
+		ModifyView       bool `spec:"modify_view"`
+		RenameView       bool `spec:"rename_view"`
 		RenameConstraint bool `spec:"rename_constraint"`
 		schemahcl.DefaultExtension
 	}
@@ -427,6 +431,7 @@ func (d *Diff) Options() (opts []schema.DiffOption) {
 	)
 	for _, c := range []schema.Change{
 		&schema.AddSchema{}, &schema.DropSchema{}, &schema.ModifySchema{},
+		&schema.AddView{}, &schema.DropView{}, &schema.ModifyView{}, &schema.RenameView{},
 		&schema.AddTable{}, &schema.DropTable{}, &schema.ModifyTable{}, &schema.RenameTable{},
 		&schema.AddColumn{}, &schema.DropColumn{}, &schema.ModifyColumn{}, &schema.AddIndex{},
 		&schema.DropIndex{}, &schema.ModifyIndex{}, &schema.AddForeignKey{}, &schema.DropForeignKey{},
