@@ -35,6 +35,21 @@ type (
 		Range *hcl.Range `spec:",range"`
 	}
 
+	// View holds a specification for an SQL view.
+	View struct {
+		Name      string         `spec:",name"`
+		Qualifier string         `spec:",qualifier"`
+		Schema    *schemahcl.Ref `spec:"schema"`
+		Columns   []*Column      `spec:"column"`
+		// Indexes on (materialized) views are supported
+		// by some databases, like PostgreSQL.
+		Indexes []*Index `spec:"index"`
+		// The definition is appended as additional attribute
+		// by the spec creator to marshal it after the columns.
+		schemahcl.DefaultExtension
+		Range *hcl.Range `spec:",range"`
+	}
+
 	// Column holds a specification for a column in an SQL table.
 	Column struct {
 		Name string          `spec:",name"`
@@ -115,6 +130,18 @@ func (t *Table) SetQualifier(q string) { t.Qualifier = q }
 // SchemaRef returns the schema reference for the table.
 func (t *Table) SchemaRef() *schemahcl.Ref { return t.Schema }
 
+// Label returns the defaults label used for the view resource.
+func (v *View) Label() string { return v.Name }
+
+// QualifierLabel returns the qualifier label used for the view resource, if any.
+func (v *View) QualifierLabel() string { return v.Qualifier }
+
+// SetQualifier sets the qualifier label used for the view resource.
+func (v *View) SetQualifier(q string) { v.Qualifier = q }
+
+// SchemaRef returns the schema reference for the view.
+func (v *View) SchemaRef() *schemahcl.Ref { return v.Schema }
+
 // Label returns the defaults label used for the sequence resource.
 func (s *Sequence) Label() string { return s.Name }
 
@@ -128,6 +155,8 @@ func (s *Sequence) SetQualifier(q string) { s.Qualifier = q }
 func (s *Sequence) SchemaRef() *schemahcl.Ref { return s.Schema }
 
 func init() {
+	schemahcl.Register("view", &View{})
+	schemahcl.Register("materialized", &View{})
 	schemahcl.Register("table", &Table{})
 	schemahcl.Register("sequence", &Sequence{})
 	schemahcl.Register("schema", &Schema{})
