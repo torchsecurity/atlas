@@ -159,6 +159,9 @@ func (d *Diff) RealmDiff(from, to *schema.Realm, options ...schema.DiffOption) (
 			changes = opts.AddOrSkip(changes, addViewChange(v)...)
 		}
 	}
+	// Dependents might reside in other schemas, hence the
+	// closure is expanded on the aggregated realm changes.
+	changes = expandViewRecreates(from.Schemas, to.Schemas, changes)
 	return d.mayAnnotate(changes, opts)
 }
 
@@ -170,6 +173,7 @@ func (d *Diff) SchemaDiff(from, to *schema.Schema, options ...schema.DiffOption)
 	if err != nil {
 		return nil, err
 	}
+	changes = expandViewRecreates([]*schema.Schema{from}, []*schema.Schema{to}, changes)
 	return d.mayAnnotate(changes, opts)
 }
 
@@ -457,6 +461,18 @@ func (d *Diff) indexDiffT(from, to *schema.Table, opts *schema.DiffOptions) ([]s
 // viewDiff returns the schema changes (if any) for migrating view from
 // current state to the desired state.
 func (d *Diff) viewDiff(from, to *schema.View, opts *schema.DiffOptions) ([]schema.Change, error) {
+	// A definition change is never reported as a single (atomic) change, but as a
+	// drop followed by a create. See recreateViewChanges for the reasoning. Note,
+	// all other changes (comments, columns and indexes) are subsumed by the
+	// recreation, as the view is created from its desired state.
+	if d.viewDefChanged(from, to) {
+		// The pair stands for the modification of the view - not for the deletion
+		// and the creation of one. Hence, it is skipped as a modification is.
+		if opts.Skipped(&schema.ModifyView{From: from, To: to}) {
+			return nil, nil
+		}
+		return recreateViewChanges(from, to), nil
+	}
 	c1, err := d.indexDiffV(from, to, opts)
 	if err != nil {
 		return nil, err
@@ -466,10 +482,134 @@ func (d *Diff) viewDiff(from, to *schema.View, opts *schema.DiffOptions) ([]sche
 		return nil, err
 	}
 	var changes []schema.Change
-	if vs := append(d.ViewAttrChanges(from, to), append(c1, c2...)...); len(vs) > 0 || d.viewDefChanged(from, to) {
+	if vs := append(d.ViewAttrChanges(from, to), append(c1, c2...)...); len(vs) > 0 {
 		changes = opts.AddOrSkip(changes, &schema.ModifyView{From: from, To: to, Changes: vs})
 	}
 	return changes, nil
+}
+
+// recreateViewChanges returns the changes that replace the given view with its
+// desired state. Views hold no data, and a definition change is planned as a drop
+// followed by a create, as "CREATE OR REPLACE VIEW" restricts the column shape.
+// The two changes are reported separately (and not as a single ModifyView), because
+// the drop of a view and its creation might need to be interleaved with the drop and
+// the creation of the views that depend on it - an atomic change cannot express that.
+func recreateViewChanges(from, to *schema.View) []schema.Change {
+	return []schema.Change{
+		&schema.DropView{V: from},
+		&schema.AddView{V: to},
+	}
+}
+
+// expandViewRecreates completes the given changes with the recreation of the views
+// that depend on a view that is dropped by them. A view cannot be dropped while other
+// views still select from it, and a view that was dropped and recreated leaves its
+// dependents pointing to an object that no longer exists. Hence, the whole dependency
+// closure of a dropped view is dropped and created back with it. Views that are
+// dropped by the given changes anyway, or were already expanded, are not duplicated.
+//
+// Note, the closure is computed on the schemas that were diffed. A schema-level diff
+// sees only its own views, and dependents that reside in other schemas are not visible
+// to it - unlike a realm-level diff, which is given all schemas.
+func expandViewRecreates(fromS, toS []*schema.Schema, changes []schema.Change) []schema.Change {
+	var fromV []*schema.View
+	for _, s := range fromS {
+		fromV = append(fromV, s.Views...)
+	}
+	// Reverse index: the views that directly depend on each view.
+	refs := make(map[string][]*schema.View)
+	for _, w := range fromV {
+		for _, o := range w.Deps {
+			if v, ok := o.(*schema.View); ok {
+				refs[viewKey(v)] = append(refs[viewKey(v)], w)
+			}
+		}
+	}
+	var (
+		queue    []*schema.View
+		dropped  = make(map[string]bool)
+		visited  = make(map[string]bool)
+		modified = make(map[string]schema.Change)
+	)
+	for _, c := range changes {
+		switch c := c.(type) {
+		case *schema.DropView:
+			dropped[viewKey(c.V)], visited[viewKey(c.V)] = true, true
+			queue = append(queue, c.V)
+		case *schema.ModifyView:
+			modified[viewKey(c.From)] = c
+		}
+	}
+	expanded, subsumed := expandViewQueue(queue, toS, refs, dropped, visited, modified)
+	if len(expanded) == 0 {
+		return changes
+	}
+	planned := make([]schema.Change, 0, len(changes)+len(expanded))
+	for _, c := range changes {
+		// In-place changes (i.e. comments) of a view that
+		// is recreated are subsumed by its recreation.
+		if !subsumed[c] {
+			planned = append(planned, c)
+		}
+	}
+	return append(planned, expanded...)
+}
+
+// expandViewQueue walks the dependents of the queued views breadth-first and returns
+// the changes recreating them, along with the in-place changes they subsume.
+func expandViewQueue(queue []*schema.View, toS []*schema.Schema, refs map[string][]*schema.View, dropped, visited map[string]bool, modified map[string]schema.Change) ([]schema.Change, map[schema.Change]bool) {
+	var (
+		expanded []schema.Change
+		subsumed = make(map[schema.Change]bool)
+	)
+	for len(queue) > 0 {
+		v := queue[0]
+		queue = queue[1:]
+		for _, w := range refs[viewKey(v)] {
+			k := viewKey(w)
+			if visited[k] {
+				continue
+			}
+			// Dependents of w are recreated as well, regardless
+			// of the way w itself is handled below.
+			visited[k] = true
+			queue = append(queue, w)
+			w2, ok := findViewIn(toS, w)
+			// A view that is dropped by the changes anyway (either deleted from the
+			// desired state, or already expanded) is not dropped and created twice.
+			if dropped[k] || !ok {
+				continue
+			}
+			if c, ok := modified[k]; ok {
+				subsumed[c] = true
+			}
+			dropped[k] = true
+			expanded = append(expanded, recreateViewChanges(w, w2)...)
+		}
+	}
+	return expanded, subsumed
+}
+
+// findViewIn finds the given view in the given schemas.
+func findViewIn(schemas []*schema.Schema, v1 *schema.View) (*schema.View, bool) {
+	for _, s := range schemas {
+		if v1.Schema != nil && v1.Schema.Name != s.Name {
+			continue
+		}
+		if v2, ok := findView(s, v1); ok {
+			return v2, true
+		}
+	}
+	return nil, false
+}
+
+// viewKey returns the identity key of the given view. It matches
+// the identity reported by the SameView comparison.
+func viewKey(v *schema.View) string {
+	if v.Schema == nil {
+		return "." + v.Name
+	}
+	return v.Schema.Name + "." + v.Name
 }
 
 // viewDefChanged checks if the view definition has changed.

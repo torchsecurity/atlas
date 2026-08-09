@@ -274,6 +274,11 @@ func (s *state) dropView(drop *schema.DropView) error {
 // a DROP and a CREATE, sidestepping the column-shape restrictions of the
 // "CREATE OR REPLACE VIEW" command. Changes that do not touch the definition
 // (i.e. comments) are planned in place.
+//
+// Note, the diffing never reports a definition change as a ModifyView anymore
+// (see sqlx.recreateViewChanges), as the drop and the create must be interleaved
+// with those of the dependent views. The definition path below is kept for
+// changesets that are built by hand and passed directly to the planner.
 func (s *state) modifyView(modify *schema.ModifyView) error {
 	if err := supportedView(modify.From); err != nil {
 		return err

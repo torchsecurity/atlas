@@ -424,15 +424,39 @@ func TestDiff_Views(t *testing.T) {
 		require.IsType(t, &schema.DropView{}, changes[0])
 	})
 	t.Run("modify definition", func(t *testing.T) {
-		changes, err := drv.SchemaDiff(
-			viewSchema(schema.NewView("v1", "SELECT 1")),
-			viewSchema(schema.NewView("v1", "SELECT 2")),
-		)
+		from, to := schema.NewView("v1", "SELECT 1"), schema.NewView("v1", "SELECT 2")
+		changes, err := drv.SchemaDiff(viewSchema(from), viewSchema(to))
 		require.NoError(t, err)
-		require.Len(t, changes, 1)
-		m, ok := changes[0].(*schema.ModifyView)
-		require.True(t, ok)
-		require.Empty(t, m.Changes)
+		// A definition change is reported as a drop and a create, and not
+		// as an atomic modification, to allow interleaving it with the
+		// recreation of the views that depend on it.
+		require.Equal(t, []schema.Change{
+			&schema.DropView{V: from},
+			&schema.AddView{V: to},
+		}, changes)
+	})
+	t.Run("modify definition of a view with dependents", func(t *testing.T) {
+		var (
+			from  = viewSchema()
+			to    = viewSchema()
+			base1 = schema.NewView("base", "SELECT 1").SetSchema(from)
+			dep1  = schema.NewView("dep", "SELECT * FROM base").SetSchema(from)
+			base2 = schema.NewView("base", "SELECT 2").SetSchema(to)
+			dep2  = schema.NewView("dep", "SELECT * FROM base").SetSchema(to)
+		)
+		dep1.AddDeps(base1)
+		dep2.AddDeps(base2)
+		from.AddViews(base1, dep1)
+		to.AddViews(base2, dep2)
+		changes, err := drv.SchemaDiff(from, to)
+		require.NoError(t, err)
+		// The dependent view is unchanged, but is recreated with its base.
+		require.Equal(t, []schema.Change{
+			&schema.DropView{V: base1},
+			&schema.AddView{V: base2},
+			&schema.DropView{V: dep1},
+			&schema.AddView{V: dep2},
+		}, changes)
 	})
 	t.Run("modify comment", func(t *testing.T) {
 		changes, err := drv.SchemaDiff(
