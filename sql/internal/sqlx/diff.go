@@ -48,6 +48,9 @@ type (
 		// one state to the other. For example, dropping or adding a `CHECK` constraint.
 		TableAttrDiff(from, to *schema.Table, _ *schema.DiffOptions) ([]schema.Change, error)
 
+		// ViewAttrChanges returns the changes between the two view attributes.
+		ViewAttrChanges(from, to *schema.View) []schema.Change
+
 		// ColumnChange returns the schema changes (if any) for migrating one column to the other.
 		ColumnChange(fromT *schema.Table, from, to *schema.Column, _ *schema.DiffOptions) (schema.Change, error)
 
@@ -152,6 +155,9 @@ func (d *Diff) RealmDiff(from, to *schema.Realm, options ...schema.DiffOption) (
 		for _, t := range s1.Tables {
 			changes = opts.AddOrSkip(changes, addTableChange(t)...)
 		}
+		for _, v := range s1.Views {
+			changes = opts.AddOrSkip(changes, addViewChange(v)...)
+		}
 	}
 	return d.mayAnnotate(changes, opts)
 }
@@ -212,6 +218,27 @@ func (d *Diff) schemaDiff(from, to *schema.Schema, opts *schema.DiffOptions) ([]
 		}
 	}
 
+	// Drop or modify views.
+	for _, v1 := range from.Views {
+		v2, ok := findView(to, v1)
+		if !ok {
+			// Changing a view to materialized (and vice versa)
+			// generates a drop and add.
+			changes = opts.AddOrSkip(changes, &schema.DropView{V: v1})
+			continue
+		}
+		if change, err := d.viewDiff(v1, v2, opts); err != nil {
+			return nil, err
+		} else {
+			changes = append(changes, change...)
+		}
+	}
+	// Add views.
+	for _, v1 := range to.Views {
+		if _, ok := findView(from, v1); !ok {
+			changes = opts.AddOrSkip(changes, addViewChange(v1)...)
+		}
+	}
 	return changes, nil
 }
 
@@ -301,6 +328,11 @@ func (d *Diff) mayAnnotate(changes []schema.Change, opts *schema.DiffOptions) (_
 // addTableChange returns the changeset for creating the table.
 func addTableChange(t *schema.Table) []schema.Change {
 	return []schema.Change{&schema.AddTable{T: t}}
+}
+
+// addViewChange returns the changeset for creating the view.
+func addViewChange(v *schema.View) []schema.Change {
+	return []schema.Change{&schema.AddView{V: v}}
 }
 
 // columnDiff returns the schema changes (if any) for migrating table columns.
@@ -420,6 +452,91 @@ func (d *Diff) indexDiffT(from, to *schema.Table, opts *schema.DiffOptions) ([]s
 		changes = opts.AddOrSkip(changes, c)
 	}
 	return changes, nil
+}
+
+// viewDiff returns the schema changes (if any) for migrating view from
+// current state to the desired state.
+func (d *Diff) viewDiff(from, to *schema.View, opts *schema.DiffOptions) ([]schema.Change, error) {
+	c1, err := d.indexDiffV(from, to, opts)
+	if err != nil {
+		return nil, err
+	}
+	c2, err := d.columnDiffV(from, to, opts)
+	if err != nil {
+		return nil, err
+	}
+	var changes []schema.Change
+	if vs := append(d.ViewAttrChanges(from, to), append(c1, c2...)...); len(vs) > 0 || d.viewDefChanged(from, to) {
+		changes = opts.AddOrSkip(changes, &schema.ModifyView{From: from, To: to, Changes: vs})
+	}
+	return changes, nil
+}
+
+// viewDefChanged checks if the view definition has changed.
+// It allows the DiffDriver to override the default implementation.
+func (d *Diff) viewDefChanged(v1 *schema.View, v2 *schema.View) bool {
+	if vr, ok := d.DiffDriver.(interface {
+		ViewDefChanged(v1, v2 *schema.View) bool
+	}); ok {
+		return vr.ViewDefChanged(v1, v2)
+	}
+	return BodyDefChanged(v1.Def, v2.Def)
+}
+
+// columnDiffV returns the schema changes (if any) for migrating view columns.
+// Currently, only comment changes are supported.
+func (d *Diff) columnDiffV(from, to *schema.View, opts *schema.DiffOptions) ([]schema.Change, error) {
+	var changes []schema.Change
+	for _, c1 := range from.Columns {
+		c2, ok := to.Column(c1.Name)
+		if !ok {
+			continue
+		}
+		if change := CommentChange(c1.Attrs, c2.Attrs); change != schema.NoChange {
+			changes = opts.AddOrSkip(changes, &schema.ModifyColumn{
+				From:   c1,
+				To:     c2,
+				Change: change,
+			})
+		}
+	}
+	return changes, nil
+}
+
+// indexDiffV returns the schema changes (if any) for migrating view
+// indexes from current state to the desired state.
+func (d *Diff) indexDiffV(from, to *schema.View, opts *schema.DiffOptions) ([]schema.Change, error) {
+	var (
+		changes []schema.Change
+		exists  = make(map[*schema.Index]bool)
+	)
+	// Drop or modify indexes.
+	for _, idx1 := range from.Indexes {
+		idx2, ok := to.Index(idx1.Name)
+		if ok {
+			if change := d.indexChange(idx1, idx2); change != schema.NoChange {
+				changes = opts.AddOrSkip(changes, &schema.ModifyIndex{
+					From:   idx1,
+					To:     idx2,
+					Change: change,
+				})
+			}
+			exists[idx2] = true
+			continue
+		}
+		// Not found.
+		changes = opts.AddOrSkip(changes, &schema.DropIndex{I: idx1})
+	}
+	// Add indexes.
+	for _, idx := range to.Indexes {
+		if exists[idx] {
+			continue
+		}
+		if _, ok := from.Index(idx.Name); !ok {
+			changes = opts.AddOrSkip(changes, &schema.AddIndex{I: idx})
+		}
+	}
+	return d.askForIndexes(from.Name, changes, opts)
 }
 
 // indexChange returns the schema changes (if any) for migrating one index to the other.
@@ -822,3 +939,10 @@ func BodyDefChanged(from, to string) bool {
 	return noident(from) != noident(to)
 }
 
+// findView finds the view by its name and its type.
+func findView(s *schema.Schema, v1 *schema.View) (*schema.View, bool) {
+	if v1.Materialized() {
+		return s.Materialized(v1.Name)
+	}
+	return s.View(v1.Name)
+}

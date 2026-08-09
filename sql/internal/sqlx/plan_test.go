@@ -181,3 +181,45 @@ func TestSortDropTables_WithFK(t *testing.T) {
 	changes = []schema.Change{&schema.DropTable{T: t1}, &schema.DropTable{T: t2}}
 	require.Equal(t, []schema.Change{changes[1], changes[0]}, SortChanges(changes, nil))
 }
+
+func TestSortViewChanges(t *testing.T) {
+	var (
+		s  = schema.New("public")
+		v1 = schema.NewView("v1", "SELECT 1").SetSchema(s)
+		v2 = schema.NewView("v2", "SELECT * FROM v1").SetSchema(s)
+		v3 = schema.NewView("v3", "SELECT * FROM v2").SetSchema(s)
+		v4 = schema.NewView("v4", "SELECT 2").SetSchema(s)
+	)
+	v2.AddDeps(v1)
+	v3.AddDeps(v2)
+	// Views are created after the views they depend on.
+	changes := []schema.Change{
+		&schema.AddView{V: v3}, &schema.AddView{V: v4}, &schema.AddView{V: v2}, &schema.AddView{V: v1},
+	}
+	sorted, err := sortViewChanges(changes)
+	require.NoError(t, err)
+	require.Equal(t, []schema.Change{changes[3], changes[2], changes[0], changes[1]}, sorted)
+	// Independent views keep their input order.
+	changes = []schema.Change{&schema.AddView{V: v4}, &schema.AddView{V: v1}}
+	sorted, err = sortViewChanges(changes)
+	require.NoError(t, err)
+	require.Equal(t, changes, sorted)
+	// Views are dropped in the reverse dependency order.
+	changes = []schema.Change{
+		&schema.DropView{V: v1}, &schema.DropView{V: v2}, &schema.DropView{V: v3},
+	}
+	sorted, err = sortViewChanges(changes)
+	require.NoError(t, err)
+	require.Equal(t, []schema.Change{changes[2], changes[1], changes[0]}, sorted)
+	// A view is recreated only after it was dropped.
+	changes = []schema.Change{&schema.AddView{V: v1}, &schema.DropView{V: v1}}
+	sorted, err = sortViewChanges(changes)
+	require.NoError(t, err)
+	require.Equal(t, []schema.Change{changes[1], changes[0]}, sorted)
+	// Cyclic dependencies are reported.
+	c1, c2 := schema.NewView("c1", "").SetSchema(s), schema.NewView("c2", "").SetSchema(s)
+	c1.AddDeps(c2)
+	c2.AddDeps(c1)
+	_, err = sortViewChanges([]schema.Change{&schema.AddView{V: c1}, &schema.AddView{V: c2}})
+	require.Error(t, err)
+}

@@ -120,6 +120,10 @@ func (d *diff) TableAttrDiff(from, to *schema.Table, opts *schema.DiffOptions) (
 	return append(changes, checks...), nil
 }
 
+func (*diff) ViewAttrChanges(_, _ *schema.View) []schema.Change {
+	return nil // Not implemented.
+}
+
 // ColumnChange returns the schema changes (if any) for migrating one column to the other.
 func (d *diff) ColumnChange(fromT *schema.Table, from, to *schema.Column, _ *schema.DiffOptions) (schema.Change, error) {
 	change := sqlx.CommentChange(from.Attrs, to.Attrs)

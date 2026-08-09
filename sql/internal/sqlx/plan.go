@@ -391,18 +391,23 @@ type SortOptions struct {
 
 // SortChanges is a helper function to sort to level changes based on their priority.
 func SortChanges(changes []schema.Change, opts *SortOptions) []schema.Change {
-	var drop, other []schema.Change
+	var views, drop, other []schema.Change
 	for _, c := range changes {
 		switch c.(type) {
+		case *schema.AddView, *schema.DropView, *schema.ModifyView:
+			views = append(views, c)
 		case *schema.DropSchema, *schema.DropTable, *schema.DropObject:
 			drop = append(drop, c)
 		default:
 			other = append(other, c)
 		}
 	}
+	if planned, err := sortViewChanges(views); err == nil { // no cycles.
+		views = planned
+	}
 	// To keep backwards compatibility with previous sorting and also in case we miss any dependency between changes
-	// (see, dependsOn function) we push drop changes to the end, unless there is a dependency requirement.
-	changes = append(other, drop...)
+	// (see, dependsOn function) we push views and drop changes to the end, unless there is a dependency requirement.
+	changes = append(other, append(views, drop...)...)
 	var (
 		hasE  = make(map[struct{ e1, e2 schema.Change }]bool)
 		edges = make(map[schema.Change][]schema.Change)
@@ -440,6 +445,93 @@ func SortChanges(changes []schema.Change, opts *SortOptions) []schema.Change {
 		}
 	}
 	return planned
+}
+
+// sortViewChanges sorts the given view changes topologically by their dependencies:
+// a view is created (or modified) only after the views it depends on, and dropped
+// before them - i.e. drops are emitted in the reverse dependency order. Changes that
+// do not depend on each other keep their input order, keeping the result deterministic.
+// An error is returned in case the dependencies form a cycle.
+func sortViewChanges(changes []schema.Change) ([]schema.Change, error) {
+	const (
+		unvisited = iota
+		visiting
+		visited
+	)
+	var (
+		state   = make([]int, len(changes))
+		planned = make([]schema.Change, 0, len(changes))
+		visit   func(int) error
+	)
+	visit = func(i int) error {
+		switch state[i] {
+		case visited:
+			return nil
+		case visiting:
+			return fmt.Errorf("sqlx: cyclic dependency between view changes")
+		}
+		state[i] = visiting
+		for j := range changes {
+			if i == j || state[j] == visited || !viewChangeDepends(changes[i], changes[j]) {
+				continue
+			}
+			if err := visit(j); err != nil {
+				return err
+			}
+		}
+		state[i] = visited
+		planned = append(planned, changes[i])
+		return nil
+	}
+	for i := range changes {
+		if state[i] != unvisited {
+			continue
+		}
+		if err := visit(i); err != nil {
+			return nil, err
+		}
+	}
+	return planned, nil
+}
+
+// viewChangeDepends reports if the view change c1 must be planned after c2.
+func viewChangeDepends(c1, c2 schema.Change) bool {
+	switch c1 := c1.(type) {
+	case *schema.AddView:
+		return addViewDepends(c1.V, c2)
+	case *schema.ModifyView:
+		return addViewDepends(c1.To, c2)
+	case *schema.DropView:
+		// A view is dropped only after the views that depend on it were dropped.
+		c2, ok := c2.(*schema.DropView)
+		return ok && viewDependsOn(c2.V, c1.V)
+	}
+	return false
+}
+
+// addViewDepends reports if the creation (or modification) of
+// the given view must be planned after the given change.
+func addViewDepends(v *schema.View, c schema.Change) bool {
+	switch c := c.(type) {
+	case *schema.AddView:
+		return viewDependsOn(v, c.V)
+	case *schema.ModifyView:
+		return viewDependsOn(v, c.To)
+	case *schema.DropView:
+		// Recreating a view (e.g., switching it to materialized and vice versa)
+		// occurs after its drop, and so does the recreation of a view that
+		// dropped views depend on.
+		return SameView(v, c.V) || viewDependsOn(c.V, v)
+	}
+	return false
+}
+
+// viewDependsOn reports if v1 depends on v2.
+func viewDependsOn(v1, v2 *schema.View) bool {
+	return slices.ContainsFunc(v1.Deps, func(o schema.Object) bool {
+		d, ok := o.(*schema.View)
+		return ok && SameView(d, v2)
+	})
 }
 
 type (
@@ -498,6 +590,8 @@ func depOfDrop(o schema.Object, c schema.Change) bool {
 	switch c := c.(type) {
 	case *schema.DropTable:
 		deps = c.T.Deps
+	case *schema.DropView:
+		deps = c.V.Deps
 	}
 	return slices.Contains(deps, o)
 }
@@ -515,6 +609,16 @@ func depOfAdd(refs []schema.Object, c schema.Change) bool {
 		return slices.ContainsFunc(refs, func(o schema.Object) bool {
 			t, ok := o.(*schema.Table)
 			return ok && SameTable(c.T, t)
+		})
+	case *schema.AddView:
+		return slices.ContainsFunc(refs, func(o schema.Object) bool {
+			v, ok := o.(*schema.View)
+			return ok && SameView(c.V, v)
+		})
+	case *schema.ModifyView:
+		return slices.ContainsFunc(refs, func(o schema.Object) bool {
+			v, ok := o.(*schema.View)
+			return ok && SameView(c.To, v)
 		})
 	case *schema.AddObject:
 		o = c.O
@@ -539,6 +643,14 @@ func typeDependsOnT(t schema.Type, tt *schema.Table) bool {
 	}
 	rowT := rt.RowTypeT()
 	return rowT != nil && SameTable(rowT, tt)
+}
+
+// SameView reports if the two objects represent the same view.
+func SameView(v1, v2 *schema.View) bool {
+	if v1 == nil || v2 == nil {
+		return v1 == v2
+	}
+	return v1.Name == v2.Name && SameSchema(v1.Schema, v2.Schema)
 }
 
 // SameTable reports if the two objects represent the same table.

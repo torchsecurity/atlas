@@ -82,6 +82,12 @@ func (d *diff) TableAttrDiff(from, to *schema.Table, opts *schema.DiffOptions) (
 	})...), nil
 }
 
+// ViewAttrChanges is a stub required by the sqlx.DiffDriver interface.
+// The real implementation (comment changes) belongs to the Postgres view support.
+func (*diff) ViewAttrChanges(_, _ *schema.View) []schema.Change {
+	return nil // Not implemented.
+}
+
 // ColumnChange returns the schema changes (if any) for migrating one column to the other.
 func (d *diff) ColumnChange(_ *schema.Table, from, to *schema.Column, _ *schema.DiffOptions) (schema.Change, error) {
 	change := sqlx.CommentChange(from.Attrs, to.Attrs)

@@ -300,6 +300,12 @@ func (b *Builder) Ident(s string) *Builder {
 	return b
 }
 
+// View writes the view identifier to the builder, prefixed
+// with the schema name if exists.
+func (b *Builder) View(v *schema.View) *Builder {
+	return b.mayQualify(v.Schema, v.Name)
+}
+
 // Table writes the table identifier to the builder, prefixed
 // with the schema name if exists.
 func (b *Builder) Table(t *schema.Table) *Builder {
@@ -347,6 +353,19 @@ func (b *Builder) TableResource(t *schema.Table, r any) *Builder {
 		return b.mayQualify(t.Schema, t.Name, c.Name)
 	default:
 		panic(fmt.Sprintf("unexpected table resource: %T", r))
+	}
+}
+
+// ViewResource writes the view resource identifier to the builder, prefixed
+// with the schema name if exists.
+func (b *Builder) ViewResource(v *schema.View, r any) *Builder {
+	switch c := r.(type) {
+	case *schema.Column:
+		return b.mayQualify(v.Schema, v.Name, c.Name)
+	case *schema.Index:
+		return b.mayQualify(v.Schema, v.Name, c.Name)
+	default:
+		panic(fmt.Sprintf("unexpected view resource: %T", r))
 	}
 }
 
@@ -819,6 +838,16 @@ func dependsOn(c1, c2 schema.Change, _ SortOptions) bool {
 			}
 		}
 		return depOfAdd(c1.T.Deps, c2)
+	case *schema.AddView:
+		if c2, ok := c2.(*schema.AddSchema); ok && SameSchema(c1.V.Schema, c2.S) {
+			return true
+		}
+		return depOfAdd(c1.V.Deps, c2)
+	case *schema.ModifyView:
+		return depOfAdd(c1.To.Deps, c2)
+	case *schema.DropView:
+		// A view is dropped before the objects it depends on.
+		return depOfDrop(c1.V, c2)
 	case *schema.DropObject:
 		t, ok := c1.O.(schema.Type)
 		if !ok {
