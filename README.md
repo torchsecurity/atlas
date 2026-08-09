@@ -1,3 +1,17 @@
+# Torch fork of Atlas - community-edition Postgres view support
+
+> **This is torchsecurity's fork of [ariga/atlas](https://github.com/ariga/atlas)**
+> (Apache-2.0). The `views-ce` branch adds plain-Postgres-view support to the
+> community edition: HCL `view` blocks, inspection, diffing with dev-database
+> canonicalization, and dependency-ordered migration planning including
+> dependent-view recreation. Most of the shared-layer code is restored from
+> this repository's own pre-strip history (`bd9f7111^`, published under
+> Apache-2.0); the Postgres inspection queries, DDL builders, and view-change
+> topological ordering are original to this fork. See `DESIGN.md` for the
+> architecture, scope cuts, and acceptance gates. Materialized views are not
+> supported. This notice documents the modifications as required by the
+> Apache-2.0 license; the upstream README follows unchanged below.
+
 # Atlas - Manage Your Database Schema as Code
 
 [![Twitter](https://img.shields.io/twitter/url.svg?label=Follow%20%40atlasgo_io&style=social&url=https%3A%2F%2Ftwitter.com%2Fatlasgo_io)](https://twitter.com/atlasgo_io)

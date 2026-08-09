@@ -109,3 +109,22 @@ Layer 3 - postgres driver (worker 3), authored fresh:
    - whitespace-only reformat of a view's `as` SQL → **no diff** (proves
      dev-db canonicalization works).
 4. `check_atlas_valid_and_no_diff.sh` passes with the forked binary.
+
+## Known limitations (v1)
+
+- Materialized views: parse-only; the postgres driver errors on plan/inspect
+  paths (never silently half-works).
+- `SchemaDiff` (single-schema scope) cannot recreate dependents living in
+  other schemas; realm-level diff handles cross-schema closures. Torch is
+  single-schema (`public`), so unaffected.
+- Dependent recreation seeds only from view drops. A dropped/renamed *table*
+  breaking a view keeps upstream behavior (no expansion).
+- A base-view change recreates its whole dependent closure in one migration
+  (correct but large; e.g. touching people_stateful_current recreates 5
+  dependents).
+- `RenameView` is planned but not order-controlled (harmless in Postgres:
+  dependents track OIDs, not names).
+- CockroachDB view inspection untested; may fail rather than silently skip.
+- Cosmetic: adding/removing a declared view column without a def change
+  produces no diff on its own (in practice the def always changes too, since
+  defs are canonicalized through the dev database).
