@@ -1426,6 +1426,186 @@ func TestMigrate_New(t *testing.T) {
 	})
 }
 
+func TestMigrate_Rebase(t *testing.T) {
+	// rebaseDir creates a migration directory holding the given
+	// files (name to content) and a matching atlas.sum file.
+	rebaseDir := func(t *testing.T, files map[string]string) string {
+		p := t.TempDir()
+		for n, c := range files {
+			require.NoError(t, os.WriteFile(filepath.Join(p, n), []byte(c), 0600))
+		}
+		d, err := migrate.NewLocalDir(p)
+		require.NoError(t, err)
+		sum, err := d.Checksum()
+		require.NoError(t, err)
+		require.NoError(t, migrate.WriteSumFile(d, sum))
+		return p
+	}
+	// sqlFiles returns the names of the migration files, ordered lexicographically.
+	sqlFiles := func(t *testing.T, p string) []string {
+		fs, err := os.ReadDir(p)
+		require.NoError(t, err)
+		var names []string
+		for _, f := range fs {
+			if strings.HasSuffix(f.Name(), ".sql") {
+				names = append(names, f.Name())
+			}
+		}
+		return names
+	}
+	// version returns the version part of a migration file name.
+	version := func(n string) string {
+		return strings.SplitN(strings.TrimSuffix(n, ".sql"), "_", 2)[0]
+	}
+	requireSynced := func(t *testing.T, p string) {
+		d, err := migrate.NewLocalDir(p)
+		require.NoError(t, err)
+		require.NoError(t, migrate.Validate(d))
+	}
+	requireContent := func(t *testing.T, p, name, content string) {
+		b, err := os.ReadFile(filepath.Join(p, name))
+		require.NoError(t, err)
+		require.Equal(t, content, string(b))
+	}
+	files := func() map[string]string {
+		return map[string]string{
+			"20240101000000_first.sql":  "CREATE TABLE t1(c int);\n",
+			"20240301000000_out_of.sql": "CREATE TABLE t2(c int);\n",
+			"20240501000000_last.sql":   "CREATE TABLE t3(c int);\n",
+		}
+	}
+
+	t.Run("Version", func(t *testing.T) {
+		p := rebaseDir(t, files())
+		s, err := runCmd(migrateRebaseCmd(), "20240301000000", "--dir", "file://"+p)
+		require.Zero(t, s)
+		require.NoError(t, err)
+		names := sqlFiles(t, p)
+		require.Len(t, names, 3)
+		require.Equal(t, []string{"20240101000000_first.sql", "20240501000000_last.sql"}, names[:2])
+		// The rebased file keeps its description and sorts last.
+		require.NoFileExists(t, filepath.Join(p, "20240301000000_out_of.sql"))
+		require.Regexp(t, `^\d{14}_out_of\.sql$`, names[2])
+		require.Greater(t, version(names[2]), "20240501000000")
+		// Contents are not touched, and the sum file is updated.
+		requireContent(t, p, names[2], "CREATE TABLE t2(c int);\n")
+		requireContent(t, p, "20240101000000_first.sql", "CREATE TABLE t1(c int);\n")
+		requireContent(t, p, "20240501000000_last.sql", "CREATE TABLE t3(c int);\n")
+		requireSynced(t, p)
+	})
+
+	t.Run("Name", func(t *testing.T) {
+		p := rebaseDir(t, files())
+		s, err := runCmd(migrateRebaseCmd(), "20240301000000_out_of.sql", "--dir", "file://"+p)
+		require.Zero(t, s)
+		require.NoError(t, err)
+		names := sqlFiles(t, p)
+		require.Len(t, names, 3)
+		require.Regexp(t, `^\d{14}_out_of\.sql$`, names[2])
+		require.Greater(t, version(names[2]), "20240501000000")
+		requireSynced(t, p)
+	})
+
+	t.Run("MultipleFiles", func(t *testing.T) {
+		fs := files()
+		// A file without a description, and one that is rebased along with it.
+		fs["20240201000000.sql"] = "CREATE TABLE t4(c int);\n"
+		p := rebaseDir(t, fs)
+		// Given in the reverse order of their versions, to ensure the
+		// order of the arguments does not change the order of the files.
+		s, err := runCmd(migrateRebaseCmd(), "20240301000000", "20240201000000", "--dir", "file://"+p)
+		require.Zero(t, s)
+		require.NoError(t, err)
+		names := sqlFiles(t, p)
+		require.Len(t, names, 4)
+		require.Equal(t, []string{"20240101000000_first.sql", "20240501000000_last.sql"}, names[:2])
+		// The relative order of the rebased files is preserved, and both
+		// got distinct, consecutive versions that sort after all others.
+		require.Regexp(t, `^\d{14}\.sql$`, names[2])
+		require.Regexp(t, `^\d{14}_out_of\.sql$`, names[3])
+		require.Greater(t, version(names[2]), "20240501000000")
+		v, err := time.Parse("20060102150405", version(names[2]))
+		require.NoError(t, err)
+		require.Equal(t, v.Add(time.Second).Format("20060102150405"), version(names[3]))
+		requireContent(t, p, names[2], "CREATE TABLE t4(c int);\n")
+		requireContent(t, p, names[3], "CREATE TABLE t2(c int);\n")
+		requireSynced(t, p)
+	})
+
+	t.Run("ClockBehind", func(t *testing.T) {
+		fs := files()
+		fs["20990101000000_future.sql"] = "CREATE TABLE t5(c int);\n"
+		p := rebaseDir(t, fs)
+		s, err := runCmd(migrateRebaseCmd(), "20240301000000", "--dir", "file://"+p)
+		require.Zero(t, s)
+		require.NoError(t, err)
+		require.FileExists(t, filepath.Join(p, "20990101000001_out_of.sql"))
+		require.Equal(t, "20990101000001_out_of.sql", sqlFiles(t, p)[3])
+		requireSynced(t, p)
+	})
+
+	t.Run("UnknownVersion", func(t *testing.T) {
+		p := rebaseDir(t, files())
+		_, err := runCmd(migrateRebaseCmd(), "20240401000000", "--dir", "file://"+p)
+		require.ErrorContains(t, err, `migration file "20240401000000" was not found in the migration directory`)
+		require.Equal(t, 3, len(sqlFiles(t, p)))
+		requireSynced(t, p)
+	})
+
+	t.Run("UnknownName", func(t *testing.T) {
+		p := rebaseDir(t, files())
+		_, err := runCmd(migrateRebaseCmd(), "20240301000000_other.sql", "--dir", "file://"+p)
+		require.ErrorContains(t, err, `migration file "20240301000000_other.sql" was not found in the migration directory`)
+		requireSynced(t, p)
+	})
+
+	t.Run("DuplicateArg", func(t *testing.T) {
+		p := rebaseDir(t, files())
+		_, err := runCmd(migrateRebaseCmd(), "20240301000000", "20240301000000_out_of.sql", "--dir", "file://"+p)
+		require.ErrorContains(t, err, `migration file "20240301000000_out_of.sql" was given more than once`)
+		require.FileExists(t, filepath.Join(p, "20240301000000_out_of.sql"))
+		requireSynced(t, p)
+	})
+
+	t.Run("NoArgs", func(t *testing.T) {
+		p := rebaseDir(t, files())
+		_, err := runCmd(migrateRebaseCmd(), "--dir", "file://"+p)
+		require.ErrorContains(t, err, "requires at least 1 arg(s)")
+	})
+
+	t.Run("ChecksumError", func(t *testing.T) {
+		p := rebaseDir(t, files())
+		require.NoError(t, os.WriteFile(filepath.Join(p, "20240601000000_new.sql"), []byte("CREATE TABLE t6(c int);\n"), 0600))
+		s, err := runCmd(migrateRebaseCmd(), "20240301000000", "--dir", "file://"+p)
+		csErr := &migrate.ChecksumError{}
+		require.ErrorAs(t, err, &csErr)
+		require.Contains(t, s, "You have a checksum error")
+		// Nothing was renamed.
+		require.FileExists(t, filepath.Join(p, "20240301000000_out_of.sql"))
+	})
+
+	t.Run("NonAtlasDir", func(t *testing.T) {
+		p := rebaseDir(t, files())
+		_, err := runCmd(migrateRebaseCmd(), "20240301000000", "--dir", "file://"+p+"?format="+migrate2.FormatGoose)
+		require.ErrorContains(t, err, "'migrate rebase' supports only atlas directories, but got: *sqltool.GooseDir")
+		require.FileExists(t, filepath.Join(p, "20240301000000_out_of.sql"))
+	})
+
+	t.Run("Checkpoint", func(t *testing.T) {
+		p := t.TempDir()
+		d, err := migrate.NewLocalDir(p)
+		require.NoError(t, err)
+		require.NoError(t, d.WriteFile("20240101000000_first.sql", []byte("CREATE TABLE t1(c int);\n")))
+		require.NoError(t, d.WriteCheckpoint("20240301000000_checkpoint.sql", "", []byte("CREATE TABLE t1(c int);\n")))
+		sum, err := d.Checksum()
+		require.NoError(t, err)
+		require.NoError(t, migrate.WriteSumFile(d, sum))
+		_, err = runCmd(migrateRebaseCmd(), "20240301000000", "--dir", "file://"+p)
+		require.ErrorContains(t, err, `checkpoint file "20240301000000_checkpoint.sql" cannot be rebased`)
+		require.FileExists(t, filepath.Join(p, "20240301000000_checkpoint.sql"))
+	})
+}
+
 func TestMigrate_Validate(t *testing.T) {
 	// Without re-playing.
 	s, err := runCmd(migrateValidateCmd(), "--dir", "file://testdata/mysql")

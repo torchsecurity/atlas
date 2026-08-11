@@ -128,3 +128,61 @@ Layer 3 - postgres driver (worker 3), authored fresh:
 - Cosmetic: adding/removing a declared view column without a def change
   produces no diff on its own (in practice the def always changes too, since
   defs are canonicalized through the dev database).
+
+# `migrate rebase`
+
+A second, unrelated fork addition. `atlas migrate apply` refuses a directory
+whose files were not applied in order ("migration file ... was added out of
+order"), and the prescribed fix - `atlas migrate rebase` - is one of the
+commands the community build replaces with an abort stub. The stub is removed
+and the command implemented here.
+
+## Provenance
+
+Unlike the view code, **nothing of this command was ever published**: it has no
+pre-strip source in the upstream history, only a contract in the docs that were
+themselves stripped later. `git show 22f2cea6^:doc/md/reference.md` (the
+`atlas migrate rebase` entry) pins the usage line, the short description, the
+examples and the flag set (`--dir`, `--dir-format` only); `atlasexec`'s
+`MigrateRebaseParams` corroborates the argument shape. The implementation
+behind it is authored, not restored, and the doc'd surface is reproduced
+verbatim so the fork stays a drop-in for the official binary.
+
+## Semantics
+
+`atlas migrate rebase [flags] {name | version}...`, in
+`cmd/atlas/internal/cmdapi/migrate.go`:
+
+- Each argument selects one file, matched against `File.Name()` or
+  `File.Version()` - i.e. `20060102150405` or `20060102150405_name.sql`.
+  An argument matching nothing, and two arguments resolving to the same file,
+  are errors; nothing is renamed before every argument resolves.
+- The selected files are renamed to consecutive versions, one second apart,
+  keeping their relative order and their descriptions
+  (`<version>_<desc>.sql`, or `<version>.sql` for a file without one). File
+  contents are never touched.
+- The first new version is `migrate.NewVersion()` (now, UTC), unless the
+  directory already holds a greater version - then it is the greatest
+  remaining version plus one second, so the result sorts after every file that
+  keeps its version even when the clock is behind. Versions are always stepped
+  by parsing and adding a second, never by arithmetic on the digits.
+- A rename that fails mid-way reverts the renames already done (best-effort)
+  and reports the original error.
+- `atlas.sum` is recomputed and rewritten last, exactly as `migrate hash`
+  does. Success is silent, like `migrate hash` and `migrate new`.
+
+## Deliberate restrictions
+
+- **Atlas-format local directories only.** The dir is type-asserted to
+  `*migrate.LocalDir`; goose/flyway/dbmate/liquibase directories are rejected
+  with `'migrate rebase' supports only atlas directories, but got: %T`, as
+  `migrate new --edit` rejects them. Their naming schemes encode versions
+  differently, and a rename that guesses is worse than a refusal.
+- **No checkpoint files.** A checkpoint states the schema as of its own
+  version; moving it to the end of the directory silently changes what it
+  checkpoints. Detected through the exported `migrate.CheckpointFile`
+  interface, not through file naming.
+- **A valid `atlas.sum` is required** (`checkDir(cmd, dirURL, false)` in
+  `PreRunE`). Out-of-order files are an apply-time problem, not a checksum
+  one, so the sum must be correct before the command rewrites it - otherwise
+  a rebase would launder an unrelated, unnoticed edit into a fresh sum.
