@@ -231,11 +231,11 @@ func (d *Diff) schemaDiff(from, to *schema.Schema, opts *schema.DiffOptions) ([]
 			changes = opts.AddOrSkip(changes, &schema.DropView{V: v1})
 			continue
 		}
-		if change, err := d.viewDiff(v1, v2, opts); err != nil {
+		change, err := d.viewDiff(v1, v2, opts)
+		if err != nil {
 			return nil, err
-		} else {
-			changes = append(changes, change...)
 		}
+		changes = append(changes, change...)
 	}
 	// Add views.
 	for _, v1 := range to.Views {
