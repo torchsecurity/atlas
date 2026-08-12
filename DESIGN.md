@@ -186,3 +186,73 @@ verbatim so the fork stays a drop-in for the official binary.
   `PreRunE`). Out-of-order files are an apply-time problem, not a checksum
   one, so the sum must be correct before the command rewrites it - otherwise
   a rebase would launder an unrelated, unnoticed edit into a fresh sum.
+
+# Update check and version links
+
+A third fork addition, unrelated to the two above and authored in full. The
+community build inherited upstream's update notifier: every command reported
+the running version to `vercheck.ariga.io`, and `atlas version` linked the
+release notes and the install instructions of upstream's releases. A build of
+this fork must never report itself upstream, and the releases it was offered
+are not the ones it is built from.
+
+## The flow
+
+`cmd/atlas/main.go` runs the check once per command, around
+`cmdapi.Root.ExecuteContext`: `checkForUpdate` returns a closure whose result
+is printed to stderr after the command finished - in the background with a
+500ms grace period on a TTY, synchronously otherwise. It is skipped when
+`ATLAS_NO_UPDATE_NOTIFIER` is set to a non-empty value, as before, and now
+also when the running version is not a release of this fork
+(`cmdapi.IsForkVersion`, i.e. a semver whose pre-release part starts with
+`-views-ce`). That gate subsumes upstream's "dev mode" skip: a development
+build has no version stamped at all, and a build stamped with an upstream
+version would be compared against the wrong repository's releases.
+
+`vercheck.VerChecker.Check` is what changed underneath: one unauthenticated
+`GET https://api.github.com/repos/torchsecurity/atlas/releases/latest` with a
+3s client timeout, reading `tag_name` and `html_url` off the response and
+reporting them through the existing `Payload`/`Latest` shape and notification
+template. `~/.atlas/release.json` still throttles the check to one call per 24
+hours and is still written only after a successful response, so the throttle
+semantics are unchanged. A rate-limited or unreachable API is an error the
+caller drops silently, never a command failure. That endpoint is the only host
+the flow contacts: **no code path of the update check reaches ariga.io**, and
+the request carries no token - the fork's releases are public.
+
+The GitHub response has no equivalent of the vercheck service's security
+advisories, so `Payload.Advisory` is never set; the field and its rendering
+are kept rather than removed, since the notification template is upstream's.
+
+## Comparison by tag inequality
+
+The fork tags - `v1.3.0-views-ce.N` - are not a plain semver line: the suffix
+parses as a pre-release, which sorts *before* the `v1.3.0` it is built on, so
+upstream's `semver.Compare` against the endpoint's answer would misjudge them.
+
+The client needs no ordering at all, though. `releases/latest` already answers
+with the single release users should be on, so the check notifies when the
+returned tag differs from the running version - not when it is greater. A
+deliberate rollback (an older tag re-published as latest) is then reported as
+well, where a "greater than" comparison would go quiet on exactly the release
+that needs picking up. The cost is that a build stamped with a tag ahead of
+the published latest is told about an older release; it is the same one-line
+nag, and the fork-suffix gate keeps development builds out of it entirely.
+
+## `atlas version`
+
+`parseV` (`cmd/atlas/internal/cmdapi/cmdapi.go`) points the release-notes link
+at this fork's tag page for fork versions, and `versionInfo`
+(`internal/cmdapi/version.go`) replaces upstream's "To download an official
+version" line with this fork's releases page:
+
+```
+atlas community version v1.3.0-views-ce.3
+https://github.com/torchsecurity/atlas/releases/tag/v1.3.0-views-ce.3
+Fork releases: https://github.com/torchsecurity/atlas/releases
+```
+
+Non-fork version strings keep upstream's behavior exactly - development builds
+and canary versions link `ariga/atlas/releases/latest`, a plain semver links
+its upstream tag - so a binary of this tree stamped with an upstream version
+still prints what upstream's tests pin.

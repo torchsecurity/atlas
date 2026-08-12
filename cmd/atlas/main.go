@@ -32,7 +32,6 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/spf13/cobra"
 	_ "github.com/tursodatabase/libsql-client-go/libsql"
-	"golang.org/x/mod/semver"
 )
 
 func main() {
@@ -69,7 +68,9 @@ func main() {
 const (
 	// envNoUpdate when enabled it cancels checking for update
 	envNoUpdate = "ATLAS_NO_UPDATE_NOTIFIER"
-	vercheckURL = "https://vercheck.ariga.io"
+	// vercheckURL is the GitHub API of this fork's latest release. Fork builds are
+	// released here and only here, and must never report themselves to upstream.
+	vercheckURL = "https://api.github.com/repos/torchsecurity/atlas/releases/latest"
 )
 
 func noText() string { return "" }
@@ -80,8 +81,10 @@ func checkForUpdate(ctx context.Context) func() string {
 	if v := os.Getenv(envNoUpdate); v != "" {
 		return noText
 	}
-	// Skip if the current binary version isn't set (dev mode).
-	if !semver.IsValid(version) {
+	// Skip if the current binary version isn't a release of this fork: development
+	// builds (an unset version) have nothing to compare against, and an upstream
+	// version stamped into a fork build would be compared to the wrong releases.
+	if !cmdapi.IsForkVersion(version) {
 		return noText
 	}
 	endpoint := vercheckEndpoint(ctx)

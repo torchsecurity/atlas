@@ -23,37 +23,89 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	latestTag  = "v1.3.0-views-ce.4"
+	latestLink = "https://github.com/torchsecurity/atlas/releases/tag/" + latestTag
+)
+
 func TestVerCheck(t *testing.T) {
-	var path, ua string
+	var path, ua, accept string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		output := `{"latest":{"Version":"v0.7.2","Summary":"","Link":"https://github.com/ariga/atlas/releases/tag/v0.7.2"},"advisory":null}`
+		output := fmt.Sprintf(`{"tag_name":%q,"html_url":%q,"name":"views-ce.4"}`, latestTag, latestLink)
 		path = r.URL.Path
 		ua = r.Header.Get("User-Agent")
+		accept = r.Header.Get("Accept")
 		_, _ = w.Write([]byte(output))
 	}))
 	defer srv.Close()
 
 	home := cmdstate.TestingHome(t)
 	vc := New(srv.URL)
-	ver := "v0.1.2"
+	ver := "v1.3.0-views-ce.3"
 	check, err := vc.Check(context.Background(), ver)
 
-	require.EqualValues(t, "/atlas/"+ver, path)
+	// The endpoint is requested as given, without a version path.
+	require.EqualValues(t, "/", path)
+	require.EqualValues(t, "application/vnd.github+json", accept)
 	cloudapi.SetVersion(ver, "")
 	expUA := fmt.Sprintf("Atlas/development (%s/%s)", runtime.GOOS, runtime.GOARCH)
 	require.EqualValues(t, expUA, ua)
 	require.NoError(t, err)
 	require.EqualValues(t, &Payload{
 		Latest: &Latest{
-			Version: "v0.7.2",
+			Version: latestTag,
 			Summary: "",
-			Link:    "https://github.com/ariga/atlas/releases/tag/v0.7.2",
+			Link:    latestLink,
 		},
 	}, check)
 
 	dirs, err := os.ReadDir(filepath.Join(home, ".atlas"))
 	require.NoError(t, err)
 	require.Len(t, dirs, 1)
+}
+
+func TestVerCheckNoNotice(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		response string
+		ver      string
+	}{
+		{
+			// The running version is the latest release: nothing to report.
+			name:     "same version",
+			response: fmt.Sprintf(`{"tag_name":%q,"html_url":%q}`, latestTag, latestLink),
+			ver:      latestTag,
+		},
+		{
+			name:     "no tag",
+			response: `{}`,
+			ver:      "v1.3.0-views-ce.3",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tt.response))
+			}))
+			t.Cleanup(srv.Close)
+			cmdstate.TestingHome(t)
+			check, err := New(srv.URL).Check(context.Background(), tt.ver)
+			require.NoError(t, err)
+			require.EqualValues(t, &Payload{}, check)
+		})
+	}
+}
+
+func TestVerCheckStatusError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	cmdstate.TestingHome(t)
+	// A rate-limited GitHub API is an error to the caller, which drops the
+	// notification rather than failing the command.
+	_, err := New(srv.URL).Check(context.Background(), "v1.3.0-views-ce.3")
+	require.ErrorContains(t, err, "status: 403")
 }
 
 func TestState(t *testing.T) {

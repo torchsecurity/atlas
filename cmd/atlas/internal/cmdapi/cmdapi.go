@@ -178,6 +178,10 @@ func parseV(version string) (string, string) {
 	if ok := semver.IsValid(version); !ok {
 		return "- development", u
 	}
+	// Fork releases are published on this fork's repository, not upstream's.
+	if IsForkVersion(version) {
+		return version, forkReleaseURL(version)
+	}
 	s := strings.Split(version, "-")
 	if len(s) != 0 && s[len(s)-1] != "canary" {
 		u = fmt.Sprintf("https://github.com/ariga/atlas/releases/tag/%s", version)

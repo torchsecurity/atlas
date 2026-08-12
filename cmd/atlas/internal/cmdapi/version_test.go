@@ -37,6 +37,16 @@ func TestCLI_Version(t *testing.T) {
 			expected: "atlas community version v1.2.3\nhttps://github.com/ariga/atlas/releases/tag/v1.2.3\n",
 		},
 		{
+			name: "fork release",
+			cmd: exec.Command("go", "run",
+				"-ldflags",
+				"-X ariga.io/atlas/cmd/atlas/internal/cmdapi.version=v1.3.0-views-ce.3",
+				"ariga.io/atlas/cmd/atlas",
+				"version",
+			),
+			expected: "atlas community version v1.3.0-views-ce.3\nhttps://github.com/torchsecurity/atlas/releases/tag/v1.3.0-views-ce.3\n",
+		},
+		{
 			name: "canary",
 			cmd: exec.Command("go", "run",
 				"-ldflags",
@@ -65,6 +75,56 @@ func TestCLI_Version(t *testing.T) {
 			tt.cmd.Stderr = os.Stderr
 			require.NoError(t, tt.cmd.Run())
 			require.Equal(t, tt.expected+versionInfo, stdout.String())
+		})
+	}
+}
+
+func TestVersionLinks(t *testing.T) {
+	for _, tt := range []struct {
+		version string
+		fork    bool
+		expectV string
+		expectU string
+	}{
+		{
+			version: "",
+			expectV: "- development",
+			expectU: "https://github.com/ariga/atlas/releases/latest",
+		},
+		{
+			version: "development",
+			expectV: "- development",
+			expectU: "https://github.com/ariga/atlas/releases/latest",
+		},
+		{
+			version: "v1.2.3",
+			expectV: "v1.2.3",
+			expectU: "https://github.com/ariga/atlas/releases/tag/v1.2.3",
+		},
+		{
+			version: "v0.3.0-6539f2704b5d-canary",
+			expectV: "v0.3.0-6539f2704b5d-canary",
+			expectU: "https://github.com/ariga/atlas/releases/latest",
+		},
+		{
+			version: "v1.3.0-views-ce.3",
+			fork:    true,
+			expectV: "v1.3.0-views-ce.3",
+			expectU: "https://github.com/torchsecurity/atlas/releases/tag/v1.3.0-views-ce.3",
+		},
+		{
+			// A fork tag without a serial is still one of ours.
+			version: "v1.3.0-views-ce",
+			fork:    true,
+			expectV: "v1.3.0-views-ce",
+			expectU: "https://github.com/torchsecurity/atlas/releases/tag/v1.3.0-views-ce",
+		},
+	} {
+		t.Run(tt.version, func(t *testing.T) {
+			require.Equal(t, tt.fork, IsForkVersion(tt.version))
+			v, u := parseV(tt.version)
+			require.Equal(t, tt.expectV, v)
+			require.Equal(t, tt.expectU, u)
 		})
 	}
 }
