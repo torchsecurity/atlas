@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"text/template"
 	"time"
 
@@ -21,7 +20,12 @@ import (
 // StateFileName is the name of the file where the vercheck state is stored.
 const StateFileName = "release.json"
 
-// New returns a new VerChecker for the endpoint.
+// timeout bounds the release lookup. The check runs on every command, so a slow
+// or unreachable endpoint must not delay the CLI beyond it.
+const timeout = 3 * time.Second
+
+// New returns a new VerChecker for the endpoint. The endpoint is a GitHub
+// "releases/latest" API URL, and is requested unauthenticated.
 func New(endpoint string) *VerChecker {
 	return &VerChecker{
 		endpoint: endpoint,
@@ -44,16 +48,23 @@ type (
 		Text string `json:"text"`
 	}
 	// Payload returns information to the client about their existing version of a component.
+	// The releases endpoint reports published releases only, so it never sets Advisory; the
+	// field and its rendering are kept for the notification template.
 	Payload struct {
 		// Latest is set if there is a newer version to upgrade to.
 		Latest *Latest `json:"latest"`
 		// Advisory is set if security advisories exist for the current version.
 		Advisory *Advisory `json:"advisory"`
 	}
-	// VerChecker retrieves version information from the vercheck service.
+	// VerChecker retrieves version information from the releases endpoint.
 	VerChecker struct {
 		endpoint string
 		state    *cmdstate.File[State]
+	}
+	// release is the subset of the GitHub "releases/latest" response this check reads.
+	release struct {
+		TagName string `json:"tag_name"`
+		HTMLURL string `json:"html_url"`
 	}
 	// State stores information about local runs of VerChecker to limit the
 	// frequency in which clients poll the service for information.
@@ -69,38 +80,49 @@ var (
 	Notify *template.Template
 )
 
-// Check makes an HTTP request to endpoint to check if a new version or security advisories
-// exist for the current version. Check tries to read the latest time it was run from the
-// statePath, if found and 24 hours have not passed the check is skipped. When done, the latest
+// Check makes an unauthenticated HTTP request to endpoint, the GitHub API of this
+// fork's latest release, to check if a release other than the current version was
+// published. Check tries to read the latest time it was run from the statePath, if
+// found and 24 hours have not passed the check is skipped. When done, the latest
 // time is updated in statePath.
 func (v *VerChecker) Check(ctx context.Context, ver string) (*Payload, error) {
 	if err := v.verifyTime(); err != nil {
 		return nil, err
 	}
-	endpoint, err := url.JoinPath(v.endpoint, "atlas", ver)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, v.endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
+	req.Header.Set("Accept", "application/vnd.github+json")
 	addHeaders(ctx, req)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("status: %s", resp.Status)
 	}
-	var p Payload
-	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+	var r release
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 		return nil, err
 	}
 	if err := v.state.Write(State{CheckedAt: time.Now()}); err != nil {
 		return nil, err
 	}
-	return &p, nil
+	return r.payload(ver), nil
+}
+
+// payload reports the release to the user if it is not the running version. The fork
+// tags (e.g. "v1.3.0-views-ce.3") are not ordered by semver - their suffix parses as a
+// pre-release, which sorts before the release it is built on - so the comparison is an
+// inequality, not a "greater than": any tag other than the one running is the one to
+// upgrade to. Callers must only check versions built from this fork; see checkForUpdate.
+func (r *release) payload(ver string) *Payload {
+	if r.TagName == "" || r.TagName == ver {
+		return &Payload{}
+	}
+	return &Payload{Latest: &Latest{Version: r.TagName, Link: r.HTMLURL}}
 }
 
 func (v *VerChecker) verifyTime() error {
